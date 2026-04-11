@@ -431,16 +431,11 @@ async function run() {
   console.log("═══════════════════════════════════════════════════════════");
 
   const traded = todayCount(log);
-  if (traded >= CONFIG.maxTradesPerDay) {
-    console.log(`\n🚫 Tageslimit erreicht: ${traded}/${CONFIG.maxTradesPerDay}`);
-    return;
-  }
-  console.log(`\n✅ Trades heute: ${traded}/${CONFIG.maxTradesPerDay}`);
+  console.log(`\n✅ Trades heute: ${traded}`);
 
   const symbols = getActiveSymbols();
 
   for (const sym of symbols) {
-    if (todayCount(log) >= CONFIG.maxTradesPerDay) { console.log("🚫 Limit erreicht."); break; }
     await tradeSymbol(sym, log);
   }
 
