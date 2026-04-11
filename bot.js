@@ -82,6 +82,75 @@ function getActiveSymbols() {
 
 // ─── News ─────────────────────────────────────────────────────────────────────
 
+// ─── Liquidität & Funding ─────────────────────────────────────────────────────
+
+async function getLiquidityBias(symbol) {
+  // Nur für Crypto sinnvoll (Funding Rate + Order Book)
+  const isCrypto = CRYPTO_SYMBOLS.some(s => symbol.startsWith(s));
+  if (!isCrypto) return "neutral";
+
+  try {
+    // 1. Funding Rate — positiv = Longs zahlen = Short-Druck; negativ = Shorts zahlen = Long-Druck
+    const frRes = await fetch(
+      `https://api.bitget.com/api/v2/mix/market/current-fund-rate?symbol=${symbol}&productType=USDT-FUTURES`,
+      { signal: AbortSignal.timeout(5000) }
+    );
+    const frJson = await frRes.json();
+    const fundingRate = parseFloat(frJson?.data?.[0]?.fundingRate || 0);
+
+    // 2. Order Book Tiefe — wo sind große Kauf/Verkauf-Wände
+    const obRes = await fetch(
+      `https://api.bitget.com/api/v2/mix/market/merge-depth?symbol=${symbol}&productType=USDT-FUTURES&limit=50`,
+      { signal: AbortSignal.timeout(5000) }
+    );
+    const obJson = await obRes.json();
+    const bids = obJson?.data?.bids || [];
+    const asks = obJson?.data?.asks || [];
+
+    // Größte Liquiditätszonen finden
+    const topBid = bids.slice(0, 10).reduce((s, b) => s + parseFloat(b[1]), 0);
+    const topAsk = asks.slice(0, 10).reduce((s, a) => s + parseFloat(a[1]), 0);
+    const bidAskRatio = topBid / (topAsk || 1);
+
+    // 3. Open Interest Richtung
+    const oiRes = await fetch(
+      `https://api.bitget.com/api/v2/mix/market/open-interest?symbol=${symbol}&productType=USDT-FUTURES`,
+      { signal: AbortSignal.timeout(5000) }
+    );
+    const oiJson = await oiRes.json();
+    const openInterest = parseFloat(oiJson?.data?.openInterestList?.[0]?.size || 0);
+
+    console.log(`  Funding: ${(fundingRate*100).toFixed(4)}% | Bid/Ask Ratio: ${bidAskRatio.toFixed(2)} | OI: ${openInterest.toFixed(0)}`);
+
+    // Liquiditätsjagd-Logik:
+    // Funding stark positiv (>0.01%) → viele Longs → Market Maker kann Short-Squeeze auslösen → SHORT-Bias
+    // Funding stark negativ (<-0.01%) → viele Shorts → Long-Squeeze wahrscheinlich → LONG-Bias
+    // Bid-Wand viel größer als Ask → Käufer warten unten → Kurs wird nach unten gezogen dann Reversal LONG
+    // Ask-Wand viel größer als Bid → Verkäufer warten oben → SHORT möglich
+
+    if (fundingRate > 0.0003) {
+      console.log(`  ⚠️  Funding sehr positiv → viele Longs → Short-Squeeze Risiko`);
+      return "bearish"; // Market Maker jagt Long-Liquidierungen nach unten
+    }
+    if (fundingRate < -0.0003) {
+      console.log(`  ⚠️  Funding sehr negativ → viele Shorts → Long-Squeeze möglich`);
+      return "bullish"; // Market Maker jagt Short-Liquidierungen nach oben
+    }
+    if (bidAskRatio > 1.5) {
+      console.log(`  📗 Große Bid-Wand → Unterstützung → BULLISH`);
+      return "bullish";
+    }
+    if (bidAskRatio < 0.67) {
+      console.log(`  📕 Große Ask-Wand → Widerstand → BEARISH`);
+      return "bearish";
+    }
+
+    return "neutral";
+  } catch {
+    return "neutral";
+  }
+}
+
 async function getNewsBias(symbol) {
   const name = symbol
     .replace("USDT","")
@@ -339,9 +408,15 @@ async function tradeSymbol(symbol, log) {
     return;
   }
 
-  // 2. News
-  const newsBias = await getNewsBias(symbol);
-  console.log(`  News-Bias: ${newsBias.toUpperCase()}`);
+  // 2. Liquidität + Funding (Crypto) & News parallel
+  const [liquidityBias, newsBias] = await Promise.all([
+    getLiquidityBias(symbol),
+    getNewsBias(symbol),
+  ]);
+  console.log(`  Liquidität: ${liquidityBias.toUpperCase()} | News: ${newsBias.toUpperCase()}`);
+
+  // Kombinierter Bias: Liquidität hat mehr Gewicht als News
+  const combinedBias = liquidityBias !== "neutral" ? liquidityBias : newsBias;
 
   // 3. Marktdaten
   let candles;
@@ -363,7 +438,7 @@ async function tradeSymbol(symbol, log) {
 
   // 4. Signal
   console.log("\n── Signal ──────────────────────────────────────────────\n");
-  const { allPass, direction } = getSignal(price, ema8, vwapVal, rsi3, newsBias);
+  const { allPass, direction } = getSignal(price, ema8, vwapVal, rsi3, combinedBias);
 
   if (!allPass) return;
 
