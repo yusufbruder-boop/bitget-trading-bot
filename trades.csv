@@ -1,2 +1,13 @@
 Date,Time (UTC),Exchange,Symbol,Side,Quantity,Price,Total USD,Fee (est.),Net Amount,Order ID,Mode,Notes
 ,,,,,,,,,,,"NOTE","Hey, if you're at this stage of the video, you must be enjoying it... perhaps you could hit subscribe now? :)"
+2026-04-11,09:12:13,BitGet,BTCUSDT,,,72633.39,,,,BLOCKED,BLOCKED,"Failed: RSI(3) above 70 (reversal setup in downtrend)"
+2026-04-11,09:13:30,BitGet,BTCUSDT,BUY,0.000035,72633.40,2.53,0.0025,2.53,,LIVE,"Error: BitGet order failed: Request URL NOT FOUND"
+2026-04-11,09:13:48,BitGet,BTCUSDT,BUY,0.000035,72633.40,2.53,0.0025,2.53,,LIVE,"Error: BitGet order failed: Request URL NOT FOUND"
+2026-04-11,09:14:10,BitGet,BTCUSDT,BUY,0.000035,72633.40,2.53,0.0025,2.53,,LIVE,"Error: BitGet order failed: Parameter verification failed size"
+2026-04-11,09:14:28,BitGet,BTCUSDT,BUY,0.000035,72633.40,2.53,0.0025,2.53,1426788755997097987,LIVE,"All conditions met"
+2026-04-11,09:17:59,BTCUSDT,long,72812.30,2.53,,BLOCKED
+2026-04-11,09:18:00,ETHUSDT,long,2247.01,2.53,,BLOCKED
+2026-04-11,09:18:00,SOLUSDT,long,84.60,2.53,,BLOCKED
+2026-04-11,09:19:53,BTCUSDT,long,72797.89,2.53,,BLOCKED
+2026-04-11,09:19:54,ETHUSDT,long,2244.58,2.53,,BLOCKED
+2026-04-11,09:19:55,SOLUSDT,long,84.58,2.53,,BLOCKED
