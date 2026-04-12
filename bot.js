@@ -86,7 +86,7 @@ function getActiveSymbols() {
 
 async function getLiquidityBias(symbol) {
   // Nur für Crypto sinnvoll (Funding Rate + Order Book)
-  const isCrypto = CRYPTO_SYMBOLS.some(s => symbol.startsWith(s));
+  const isCrypto = WEEKEND_CRYPTO.some(s => symbol.startsWith(s));
   if (!isCrypto) return "neutral";
 
   try {
@@ -183,33 +183,18 @@ async function getNewsBias(symbol) {
 
 // ─── Marktdaten ───────────────────────────────────────────────────────────────
 
-const BINANCE_INTERVAL = { "1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m","1H":"1h","4H":"4h","1D":"1d" };
 const BITGET_GRANULARITY = { "1m":"1m","5m":"5m","15m":"15m","1H":"1H","4H":"4H","1D":"1Dutc" };
 
-const CRYPTO_SYMBOLS = ["BTC","ETH","SOL","XRP","BNB","ADA","DOGE","AVAX","LINK"];
-
 async function fetchCandles(symbol, limit = 200) {
-  const isCrypto = CRYPTO_SYMBOLS.some(s => symbol.startsWith(s));
-
-  if (isCrypto) {
-    // Crypto: Binance kostenlos
-    const interval = BINANCE_INTERVAL[CONFIG.timeframe] || "1m";
-    const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    if (!res.ok) throw new Error(`Binance ${res.status}`);
-    const data = await res.json();
-    return data.map(k => ({ time:+k[0], open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5] }));
-  } else {
-    // Aktien/Rohstoffe: BitGet
-    const gran = BITGET_GRANULARITY[CONFIG.timeframe] || "1m";
-    const url = `${CONFIG.bitget.baseUrl}/api/v2/mix/market/candles?symbol=${symbol}&productType=USDT-FUTURES&granularity=${gran}&limit=${limit}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    const json = await res.json();
-    if (json.code !== "00000") throw new Error(`BitGet Kerzen: ${json.msg}`);
-    return json.data
-      .map(k => ({ time:+k[0], open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5] }))
-      .reverse();
-  }
+  // Alle Daten von BitGet holen (Crypto + Aktien/Rohstoffe)
+  const gran = BITGET_GRANULARITY[CONFIG.timeframe] || "1m";
+  const url = `${CONFIG.bitget.baseUrl}/api/v2/mix/market/candles?symbol=${symbol}&productType=USDT-FUTURES&granularity=${gran}&limit=${limit}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+  const json = await res.json();
+  if (json.code !== "00000") throw new Error(`BitGet Kerzen: ${json.msg}`);
+  return json.data
+    .map(k => ({ time:+k[0], open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5] }))
+    .reverse();
 }
 
 // ─── Indikatoren ──────────────────────────────────────────────────────────────
