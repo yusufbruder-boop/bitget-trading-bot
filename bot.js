@@ -518,10 +518,31 @@ async function run() {
   console.log("\n═══════════════════════════════════════════════════════════\n");
 }
 
+// ─── Loop-Konfiguration ───────────────────────────────────────────────────────
+
+const LOOP_INTERVAL_MINUTES = parseInt(process.env.LOOP_INTERVAL_MINUTES || "15");
+const LOOP_INTERVAL_MS = LOOP_INTERVAL_MINUTES * 60 * 1000;
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function main() {
+  while (true) {
+    try {
+      await run();
+    } catch (e) {
+      console.error("Fehler in run():", e);
+    }
+    console.log(`\n⏳ Nächste Ausführung in ${LOOP_INTERVAL_MINUTES} Minuten...`);
+    await sleep(LOOP_INTERVAL_MS);
+  }
+}
+
 if (process.argv.includes("--tax-summary")) {
   const lines = existsSync(CSV_FILE) ? readFileSync(CSV_FILE,"utf8").trim().split("\n").slice(1) : [];
   const live  = lines.filter(l => l.includes(",LIVE"));
   console.log(`\nTrades gesamt: ${lines.length} | Live: ${live.length} | Paper: ${lines.filter(l=>l.includes(",PAPER")).length}`);
 } else {
-  run().catch(e => { console.error("Fehler:", e); process.exit(1); });
+  main().catch(e => { console.error("Fatal:", e); process.exit(1); });
 }
