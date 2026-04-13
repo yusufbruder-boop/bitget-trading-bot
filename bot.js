@@ -1,17 +1,13 @@
 /**
- * BitGet Trading Bot — Professionelle Version
+ * BitGet Trading Bot — Professionelle Version (FIXED)
  *
- * Verbesserungen gegenüber Original:
- * - TP/SL automatisch bei jeder Order gesetzt
- * - Gebühren-Prüfung: Trade nur wenn Profit > 5× Gebühren
- * - Leverage wird vor jedem Trade gesetzt
- * - Offene Positionen werden geprüft (kein Doppeln)
- * - Aktien-Kerzen direkt von BitGet (nicht Binance)
- * - Wochentag-Strategie: Crypto am Wochenende, Aktien+Rohstoffe Mo-Fr
- * - News-Filter für Richtungsbestätigung
- *
- * BitGet Futures Taker-Gebühr: 0.06% pro Seite = 0.12% Round-Trip
- * Minimum Profit-Ziel: 5× Gebühren = 0.60% des Nominalwerts
+ * Fixes:
+ * 1. getOpenPosition: try-catch hinzugefügt → kein Crash bei API-Fehler
+ * 2. run(): try-catch um tradeSymbol → ein Symbol crasht nicht alle
+ * 3. MAX_TRADES_PER_DAY: wird jetzt tatsächlich geprüft
+ * 4. RSI-Bedingung: < 30 / > 70 → > 50 / < 50 (Bot tradet jetzt)
+ * 5. RSI flat-candles: gibt 50 zurück statt 100
+ * 6. COPPERUSDT → XCUUSDT (richtiger Bitget Ticker)
  */
 
 import "dotenv/config";
@@ -20,11 +16,11 @@ import crypto from "crypto";
 
 // ─── Konfiguration ────────────────────────────────────────────────────────────
 
-const TAKER_FEE_RATE = 0.0006;          // 0.06% pro Seite
-const MIN_PROFIT_FEE_MULTIPLIER = 5;    // Profit muss > 5× Gebühren sein
+const TAKER_FEE_RATE = 0.0006;
+const MIN_PROFIT_FEE_MULTIPLIER = 5;
 
 const CONFIG = {
-  timeframe:       process.env.TIMEFRAME        || "1m",
+  timeframe:       process.env.TIMEFRAME                || "1m",
   portfolioValue:  parseFloat(process.env.PORTFOLIO_VALUE_USD  || "253"),
   maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD   || "50"),
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY     || "5"),
@@ -55,11 +51,12 @@ const WEEKDAY_COMMODITIES = [
   "XAUUSDT",    // Gold
   "XAGUSDT",    // Silber
   "NATGASUSDT", // Erdgas
-  "COPPERUSDT", // Kupfer
+  "XCUUSDT",    // Kupfer — FIX: war COPPERUSDT (existiert nicht auf Bitget)
 ];
 
 const NEWS_BULLISH = ["ceasefire","peace","deal","rate cut","etf approved","stimulus","upgrade","earnings beat","ai","partnership","profit","growth","record"];
 const NEWS_BEARISH = ["war","attack","invasion","tariff","ban","crash","recession","rate hike","miss","downgrade","hack","bankruptcy","fraud","loss","sanction"];
+const CRYPTO_SYMBOLS = ["BTC","ETH","SOL","XRP","BNB","ADA","DOGE","AVAX","LINK"];
 
 const LOG_FILE = "safety-check-log.json";
 const CSV_FILE = "trades.csv";
@@ -80,17 +77,13 @@ function getActiveSymbols() {
   return [...WEEKDAY_STOCKS, ...WEEKDAY_COMMODITIES];
 }
 
-// ─── News ─────────────────────────────────────────────────────────────────────
-
 // ─── Liquidität & Funding ─────────────────────────────────────────────────────
 
 async function getLiquidityBias(symbol) {
-  // Nur für Crypto sinnvoll (Funding Rate + Order Book)
   const isCrypto = CRYPTO_SYMBOLS.some(s => symbol.startsWith(s));
   if (!isCrypto) return "neutral";
 
   try {
-    // 1. Funding Rate — positiv = Longs zahlen = Short-Druck; negativ = Shorts zahlen = Long-Druck
     const frRes = await fetch(
       `https://api.bitget.com/api/v2/mix/market/current-fund-rate?symbol=${symbol}&productType=USDT-FUTURES`,
       { signal: AbortSignal.timeout(5000) }
@@ -98,7 +91,6 @@ async function getLiquidityBias(symbol) {
     const frJson = await frRes.json();
     const fundingRate = parseFloat(frJson?.data?.[0]?.fundingRate || 0);
 
-    // 2. Order Book Tiefe — wo sind große Kauf/Verkauf-Wände
     const obRes = await fetch(
       `https://api.bitget.com/api/v2/mix/market/merge-depth?symbol=${symbol}&productType=USDT-FUTURES&limit=50`,
       { signal: AbortSignal.timeout(5000) }
@@ -107,12 +99,10 @@ async function getLiquidityBias(symbol) {
     const bids = obJson?.data?.bids || [];
     const asks = obJson?.data?.asks || [];
 
-    // Größte Liquiditätszonen finden
     const topBid = bids.slice(0, 10).reduce((s, b) => s + parseFloat(b[1]), 0);
     const topAsk = asks.slice(0, 10).reduce((s, a) => s + parseFloat(a[1]), 0);
     const bidAskRatio = topBid / (topAsk || 1);
 
-    // 3. Open Interest Richtung
     const oiRes = await fetch(
       `https://api.bitget.com/api/v2/mix/market/open-interest?symbol=${symbol}&productType=USDT-FUTURES`,
       { signal: AbortSignal.timeout(5000) }
@@ -120,36 +110,20 @@ async function getLiquidityBias(symbol) {
     const oiJson = await oiRes.json();
     const openInterest = parseFloat(oiJson?.data?.openInterestList?.[0]?.size || 0);
 
-    console.log(`  Funding: ${(fundingRate*100).toFixed(4)}% | Bid/Ask Ratio: ${bidAskRatio.toFixed(2)} | OI: ${openInterest.toFixed(0)}`);
+    console.log(`  Funding: ${(fundingRate*100).toFixed(4)}% | Bid/Ask: ${bidAskRatio.toFixed(2)} | OI: ${openInterest.toFixed(0)}`);
 
-    // Liquiditätsjagd-Logik:
-    // Funding stark positiv (>0.01%) → viele Longs → Market Maker kann Short-Squeeze auslösen → SHORT-Bias
-    // Funding stark negativ (<-0.01%) → viele Shorts → Long-Squeeze wahrscheinlich → LONG-Bias
-    // Bid-Wand viel größer als Ask → Käufer warten unten → Kurs wird nach unten gezogen dann Reversal LONG
-    // Ask-Wand viel größer als Bid → Verkäufer warten oben → SHORT möglich
-
-    if (fundingRate > 0.0003) {
-      console.log(`  ⚠️  Funding sehr positiv → viele Longs → Short-Squeeze Risiko`);
-      return "bearish"; // Market Maker jagt Long-Liquidierungen nach unten
-    }
-    if (fundingRate < -0.0003) {
-      console.log(`  ⚠️  Funding sehr negativ → viele Shorts → Long-Squeeze möglich`);
-      return "bullish"; // Market Maker jagt Short-Liquidierungen nach oben
-    }
-    if (bidAskRatio > 1.5) {
-      console.log(`  📗 Große Bid-Wand → Unterstützung → BULLISH`);
-      return "bullish";
-    }
-    if (bidAskRatio < 0.67) {
-      console.log(`  📕 Große Ask-Wand → Widerstand → BEARISH`);
-      return "bearish";
-    }
+    if (fundingRate > 0.0003) { console.log(`  ⚠️  Funding sehr positiv → Short-Bias`);  return "bearish"; }
+    if (fundingRate < -0.0003) { console.log(`  ⚠️  Funding sehr negativ → Long-Bias`);   return "bullish"; }
+    if (bidAskRatio > 1.5)    { console.log(`  📗 Große Bid-Wand → BULLISH`);             return "bullish"; }
+    if (bidAskRatio < 0.67)   { console.log(`  📕 Große Ask-Wand → BEARISH`);             return "bearish"; }
 
     return "neutral";
   } catch {
     return "neutral";
   }
 }
+
+// ─── News ─────────────────────────────────────────────────────────────────────
 
 async function getNewsBias(symbol) {
   const name = symbol
@@ -158,7 +132,7 @@ async function getNewsBias(symbol) {
     .replace("NVDA","Nvidia").replace("TSLA","Tesla").replace("AAPL","Apple")
     .replace("MSFT","Microsoft").replace("GOOGL","Google").replace("AMZN","Amazon")
     .replace("META","Meta").replace("XAU","Gold").replace("XAG","Silver")
-    .replace("NATGAS","Natural Gas").replace("COPPER","Copper");
+    .replace("NATGAS","Natural Gas").replace("XCU","Copper");
 
   try {
     const url = `https://news.google.com/rss/search?q=${encodeURIComponent(name)}&hl=en-US&gl=US&ceid=US:en`;
@@ -183,16 +157,13 @@ async function getNewsBias(symbol) {
 
 // ─── Marktdaten ───────────────────────────────────────────────────────────────
 
-const BINANCE_INTERVAL = { "1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m","1H":"1h","4H":"4h","1D":"1d" };
+const BINANCE_INTERVAL  = { "1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m","1H":"1h","4H":"4h","1D":"1d" };
 const BITGET_GRANULARITY = { "1m":"1m","5m":"5m","15m":"15m","1H":"1H","4H":"4H","1D":"1Dutc" };
-
-const CRYPTO_SYMBOLS = ["BTC","ETH","SOL","XRP","BNB","ADA","DOGE","AVAX","LINK"];
 
 async function fetchCandles(symbol, limit = 200) {
   const isCrypto = CRYPTO_SYMBOLS.some(s => symbol.startsWith(s));
 
   if (isCrypto) {
-    // Crypto: Binance kostenlos
     const interval = BINANCE_INTERVAL[CONFIG.timeframe] || "1m";
     const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
     const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
@@ -200,7 +171,6 @@ async function fetchCandles(symbol, limit = 200) {
     const data = await res.json();
     return data.map(k => ({ time:+k[0], open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5] }));
   } else {
-    // Aktien/Rohstoffe: BitGet
     const gran = BITGET_GRANULARITY[CONFIG.timeframe] || "1m";
     const url = `${CONFIG.bitget.baseUrl}/api/v2/mix/market/candles?symbol=${symbol}&productType=USDT-FUTURES&granularity=${gran}&limit=${limit}`;
     const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
@@ -217,40 +187,43 @@ async function fetchCandles(symbol, limit = 200) {
 function ema(closes, period) {
   if (closes.length < period) return null;
   const k = 2 / (period + 1);
-  let val = closes.slice(0, period).reduce((a,b) => a+b, 0) / period;
-  for (let i = period; i < closes.length; i++) val = closes[i]*k + val*(1-k);
+  let val = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < closes.length; i++) val = closes[i] * k + val * (1 - k);
   return val;
 }
 
+// FIX: RSI gibt jetzt 50 zurück wenn keine Bewegung (statt fälschlich 100)
 function rsi(closes, period = 3) {
   if (closes.length < period + 1) return null;
   let g = 0, l = 0;
   for (let i = closes.length - period; i < closes.length; i++) {
-    const d = closes[i] - closes[i-1];
+    const d = closes[i] - closes[i - 1];
     if (d > 0) g += d; else l -= d;
   }
+  const avgG = g / period;
   const avgL = l / period;
+  if (avgL === 0 && avgG === 0) return 50;  // FIX: keine Bewegung → neutral
   if (avgL === 0) return 100;
-  return 100 - 100 / (1 + (g/period) / avgL);
+  return 100 - 100 / (1 + avgG / avgL);
 }
 
 function vwap(candles) {
-  const midnight = new Date(); midnight.setUTCHours(0,0,0,0);
+  const midnight = new Date(); midnight.setUTCHours(0, 0, 0, 0);
   const sess = candles.filter(c => c.time >= midnight.getTime());
   if (!sess.length) return null;
-  const tpv = sess.reduce((s,c) => s + ((c.high+c.low+c.close)/3)*c.volume, 0);
-  const vol = sess.reduce((s,c) => s + c.volume, 0);
+  const tpv = sess.reduce((s, c) => s + ((c.high + c.low + c.close) / 3) * c.volume, 0);
+  const vol = sess.reduce((s, c) => s + c.volume, 0);
   return vol === 0 ? null : tpv / vol;
 }
 
 // ─── Gebühren-Check ───────────────────────────────────────────────────────────
 
 function feeCheck(marginUSD, leverage, tpPct) {
-  const notional    = marginUSD * leverage;
-  const feeRoundTrip = notional * TAKER_FEE_RATE * 2;   // Entry + Exit
-  const tpProfit    = notional * (tpPct / 100);
-  const ratio       = tpProfit / feeRoundTrip;
-  const ok          = ratio >= MIN_PROFIT_FEE_MULTIPLIER;
+  const notional     = marginUSD * leverage;
+  const feeRoundTrip = notional * TAKER_FEE_RATE * 2;
+  const tpProfit     = notional * (tpPct / 100);
+  const ratio        = tpProfit / feeRoundTrip;
+  const ok           = ratio >= MIN_PROFIT_FEE_MULTIPLIER;
   console.log(`  Gebühren-Check: Notional=$${notional.toFixed(0)} | Fees=$${feeRoundTrip.toFixed(3)} | TP-Gewinn=$${tpProfit.toFixed(2)} | Ratio=${ratio.toFixed(1)}× ${ok ? "✅" : "🚫"}`);
   return { ok, notional, feeRoundTrip, tpProfit };
 }
@@ -280,14 +253,21 @@ async function bitgetRequest(method, path, body = null) {
   return res.json();
 }
 
-// Offene Positionen für Symbol prüfen
+// FIX: try-catch hinzugefügt → API-Fehler crashen nicht mehr die ganze App
 async function getOpenPosition(symbol) {
-  const res = await bitgetRequest("GET", `/api/v2/mix/position/single-position?symbol=${symbol}&productType=USDT-FUTURES&marginCoin=USDT`);
-  if (res.code !== "00000") return null;
-  return res.data?.find(p => parseFloat(p.total || 0) > 0) || null;
+  try {
+    const res = await bitgetRequest(
+      "GET",
+      `/api/v2/mix/position/single-position?symbol=${symbol}&productType=USDT-FUTURES&marginCoin=USDT`
+    );
+    if (res.code !== "00000") return null;
+    return res.data?.find(p => parseFloat(p.total || 0) > 0) || null;
+  } catch (e) {
+    console.log(`  ⚠️  Position-Check Fehler: ${e.message}`);
+    return null;
+  }
 }
 
-// Leverage setzen
 async function setLeverage(symbol, leverage) {
   for (const side of ["long", "short"]) {
     await bitgetRequest("POST", "/api/v2/mix/account/set-leverage", {
@@ -297,22 +277,20 @@ async function setLeverage(symbol, leverage) {
   }
 }
 
-// Order mit TP/SL platzieren
 async function placeOrder(symbol, direction, marginUSD, price) {
-  const side      = direction === "long" ? "buy" : "sell";
-  const rawSize   = (marginUSD * CONFIG.leverage) / price;
-  const size      = Math.max(rawSize, 0.001).toFixed(4);
+  const side    = direction === "long" ? "buy" : "sell";
+  const rawSize = (marginUSD * CONFIG.leverage) / price;
+  const size    = Math.max(rawSize, 0.001).toFixed(4);
 
-  const tpPrice   = direction === "long"
+  const tpPrice = direction === "long"
     ? (price * (1 + CONFIG.tpPercent / 100)).toFixed(2)
     : (price * (1 - CONFIG.tpPercent / 100)).toFixed(2);
 
-  const slPrice   = direction === "long"
+  const slPrice = direction === "long"
     ? (price * (1 - CONFIG.slPercent / 100)).toFixed(2)
     : (price * (1 + CONFIG.slPercent / 100)).toFixed(2);
 
-  const path = "/api/v2/mix/order/place-order";
-  const body = {
+  const res = await bitgetRequest("POST", "/api/v2/mix/order/place-order", {
     symbol,
     productType:            "USDT-FUTURES",
     marginMode:             "isolated",
@@ -323,16 +301,15 @@ async function placeOrder(symbol, direction, marginUSD, price) {
     orderType:              "market",
     presetStopSurplusPrice: tpPrice,
     presetStopLossPrice:    slPrice,
-  };
-
-  const res = await bitgetRequest("POST", path, body);
+  });
   if (res.code !== "00000") throw new Error(`${res.msg} (${res.code})`);
   return { orderId: res.data.orderId, tpPrice, slPrice, size };
 }
 
 // ─── Signal-Logik ─────────────────────────────────────────────────────────────
 
-function getSignal(price, ema8, vwapVal, rsi3, newsBias) {
+// FIX: RSI-Bedingung → > 50 für LONG, < 50 für SHORT (war < 30 / > 70 → tradet nie)
+function getSignal(price, ema8, vwapVal, rsi3, combinedBias) {
   const results = [];
   const check = (label, cond, req, actual) => {
     results.push({ label, pass: cond });
@@ -343,24 +320,24 @@ function getSignal(price, ema8, vwapVal, rsi3, newsBias) {
   const bearish = price < vwapVal && price < ema8;
   const distPct = Math.abs((price - vwapVal) / vwapVal) * 100;
 
-  if (newsBias === "bearish" && bullish) { console.log("  ⚠️  News bearish vs Chart bullish — kein Trade"); return { allPass: false, direction: null }; }
-  if (newsBias === "bullish" && bearish) { console.log("  ⚠️  News bullish vs Chart bearish — kein Trade"); return { allPass: false, direction: null }; }
+  if (combinedBias === "bearish" && bullish) { console.log("  ⚠️  Bias bearish vs Chart bullish — kein Trade"); return { allPass: false, direction: null }; }
+  if (combinedBias === "bullish" && bearish) { console.log("  ⚠️  Bias bullish vs Chart bearish — kein Trade"); return { allPass: false, direction: null }; }
 
   if (bullish) {
     console.log("  Richtung: LONG");
-    check("Preis > VWAP",     price > vwapVal,  `>${vwapVal.toFixed(2)}`, price.toFixed(2));
-    check("Preis > EMA(8)",   price > ema8,     `>${ema8.toFixed(2)}`,    price.toFixed(2));
-    check("RSI(3) < 30",      rsi3 < 30,        "< 30",                   rsi3.toFixed(2));
-    check("Dist VWAP < 1.5%", distPct < 1.5,    "< 1.5%",                 `${distPct.toFixed(2)}%`);
+    check("Preis > VWAP",     price > vwapVal, `>${vwapVal.toFixed(2)}`, price.toFixed(2));
+    check("Preis > EMA(8)",   price > ema8,    `>${ema8.toFixed(2)}`,    price.toFixed(2));
+    check("RSI(3) > 50",      rsi3 > 50,       "> 50",                   rsi3.toFixed(2));  // FIX: war < 30
+    check("Dist VWAP < 1.5%", distPct < 1.5,   "< 1.5%",                 `${distPct.toFixed(2)}%`);
     return { allPass: results.every(r => r.pass), direction: "long" };
   }
 
   if (bearish) {
     console.log("  Richtung: SHORT");
-    check("Preis < VWAP",     price < vwapVal,  `<${vwapVal.toFixed(2)}`, price.toFixed(2));
-    check("Preis < EMA(8)",   price < ema8,     `<${ema8.toFixed(2)}`,    price.toFixed(2));
-    check("RSI(3) > 70",      rsi3 > 70,        "> 70",                   rsi3.toFixed(2));
-    check("Dist VWAP < 1.5%", distPct < 1.5,    "< 1.5%",                 `${distPct.toFixed(2)}%`);
+    check("Preis < VWAP",     price < vwapVal, `<${vwapVal.toFixed(2)}`, price.toFixed(2));
+    check("Preis < EMA(8)",   price < ema8,    `<${ema8.toFixed(2)}`,    price.toFixed(2));
+    check("RSI(3) < 50",      rsi3 < 50,       "< 50",                   rsi3.toFixed(2));  // FIX: war > 70
+    check("Dist VWAP < 1.5%", distPct < 1.5,   "< 1.5%",                 `${distPct.toFixed(2)}%`);
     return { allPass: results.every(r => r.pass), direction: "short" };
   }
 
@@ -385,11 +362,11 @@ function initCsv() { if (!existsSync(CSV_FILE)) writeFileSync(CSV_FILE, CSV_HEAD
 function writeCsv(e) {
   const d = new Date(e.timestamp);
   appendFileSync(CSV_FILE, [
-    d.toISOString().slice(0,10), d.toISOString().slice(11,19),
-    e.symbol, e.direction||"BLOCKED", e.price?.toFixed(2)||"",
-    e.margin?.toFixed(2)||"", e.notional?.toFixed(2)||"",
-    e.tpPrice||"", e.slPrice||"",
-    e.orderId||"",
+    d.toISOString().slice(0, 10), d.toISOString().slice(11, 19),
+    e.symbol, e.direction || "BLOCKED", e.price?.toFixed(2) || "",
+    e.margin?.toFixed(2) || "", e.notional?.toFixed(2) || "",
+    e.tpPrice || "", e.slPrice || "",
+    e.orderId || "",
     e.paperTrading ? "PAPER" : (e.orderPlaced ? "LIVE" : "BLOCKED"),
   ].join(",") + "\n");
 }
@@ -415,7 +392,6 @@ async function tradeSymbol(symbol, log) {
   ]);
   console.log(`  Liquidität: ${liquidityBias.toUpperCase()} | News: ${newsBias.toUpperCase()}`);
 
-  // Kombinierter Bias: Liquidität hat mehr Gewicht als News
   const combinedBias = liquidityBias !== "neutral" ? liquidityBias : newsBias;
 
   // 3. Marktdaten
@@ -429,7 +405,7 @@ async function tradeSymbol(symbol, log) {
   const vwapVal = vwap(candles);
   const rsi3    = rsi(closes, 3);
 
-  console.log(`\n  Preis $${price.toFixed(2)}  EMA8 $${ema8?.toFixed(2)||"?"}  VWAP $${vwapVal?.toFixed(2)||"?"}  RSI3 ${rsi3?.toFixed(1)||"?"}`);
+  console.log(`\n  Preis $${price.toFixed(2)}  EMA8 $${ema8?.toFixed(2) || "?"}  VWAP $${vwapVal?.toFixed(2) || "?"}  RSI3 ${rsi3?.toFixed(1) || "?"}`);
 
   if (vwapVal === null || rsi3 === null || ema8 === null) {
     console.log("  ⚠️  Nicht genug Daten");
@@ -448,11 +424,11 @@ async function tradeSymbol(symbol, log) {
   const { ok: feesOk, notional, tpProfit, feeRoundTrip } = feeCheck(margin, CONFIG.leverage, CONFIG.tpPercent);
 
   if (!feesOk) {
-    console.log(`  🚫 Trade unrentabel: Profit $${tpProfit.toFixed(2)} < 5× Gebühren $${(feeRoundTrip*5).toFixed(2)}`);
+    console.log(`  🚫 Trade unrentabel: Profit $${tpProfit.toFixed(2)} < 5× Gebühren $${(feeRoundTrip * 5).toFixed(2)}`);
     return;
   }
 
-  console.log(`  TP +${CONFIG.tpPercent}% = +$${tpProfit.toFixed(2)} | SL -${CONFIG.slPercent}% = -$${(notional*CONFIG.slPercent/100+feeRoundTrip).toFixed(2)} | Net nach Gebühren: +$${(tpProfit-feeRoundTrip).toFixed(2)}`);
+  console.log(`  TP +${CONFIG.tpPercent}% = +$${tpProfit.toFixed(2)} | SL -${CONFIG.slPercent}% = -$${(notional * CONFIG.slPercent / 100 + feeRoundTrip).toFixed(2)} | Net: +$${(tpProfit - feeRoundTrip).toFixed(2)}`);
 
   // 6. Order
   console.log(`\n── Order ───────────────────────────────────────────────\n`);
@@ -465,11 +441,11 @@ async function tradeSymbol(symbol, log) {
   };
 
   if (CONFIG.paperTrading) {
-    const tp = direction === "long" ? price*(1+CONFIG.tpPercent/100) : price*(1-CONFIG.tpPercent/100);
-    const sl = direction === "long" ? price*(1-CONFIG.slPercent/100) : price*(1+CONFIG.slPercent/100);
-    logEntry.orderId = `PAPER-${Date.now()}`;
-    logEntry.tpPrice = tp.toFixed(2);
-    logEntry.slPrice = sl.toFixed(2);
+    const tp = direction === "long" ? price * (1 + CONFIG.tpPercent / 100) : price * (1 - CONFIG.tpPercent / 100);
+    const sl = direction === "long" ? price * (1 - CONFIG.slPercent / 100) : price * (1 + CONFIG.slPercent / 100);
+    logEntry.orderId    = `PAPER-${Date.now()}`;
+    logEntry.tpPrice    = tp.toFixed(2);
+    logEntry.slPrice    = sl.toFixed(2);
     logEntry.orderPlaced = true;
     console.log(`  📋 PAPER — würde ${direction.toUpperCase()} @ ${price.toFixed(2)} | TP ${tp.toFixed(2)} | SL ${sl.toFixed(2)}`);
   } else {
@@ -500,18 +476,35 @@ async function run() {
   const log = loadLog();
 
   console.log("═══════════════════════════════════════════════════════════");
-  console.log("  BitGet Trading Bot — Professionell");
+  console.log("  BitGet Trading Bot");
   console.log(`  ${new Date().toISOString()}`);
   console.log(`  ${CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE"} | ${CONFIG.leverage}x | TP ${CONFIG.tpPercent}% | SL ${CONFIG.slPercent}%`);
   console.log("═══════════════════════════════════════════════════════════");
 
+  // FIX: MAX_TRADES_PER_DAY wird jetzt tatsächlich geprüft
   const traded = todayCount(log);
-  console.log(`\n✅ Trades heute: ${traded}`);
+  console.log(`\n✅ Trades heute: ${traded}/${CONFIG.maxTradesPerDay}`);
+
+  if (traded >= CONFIG.maxTradesPerDay) {
+    console.log("🛑 Tageslimit erreicht — kein weiterer Trade.");
+    return;
+  }
 
   const symbols = getActiveSymbols();
+  const remaining = CONFIG.maxTradesPerDay - traded;
 
   for (const sym of symbols) {
-    await tradeSymbol(sym, log);
+    // Nochmal prüfen falls im Loop bereits trades passiert sind
+    if (todayCount(log) >= CONFIG.maxTradesPerDay) {
+      console.log("🛑 Tageslimit erreicht — stoppe.");
+      break;
+    }
+    // FIX: try-catch um tradeSymbol → ein Symbol crasht nicht alle anderen
+    try {
+      await tradeSymbol(sym, log);
+    } catch (e) {
+      console.log(`  ❌ ${sym} unerwarteter Fehler: ${e.message}`);
+    }
   }
 
   saveLog(log);
@@ -519,9 +512,9 @@ async function run() {
 }
 
 if (process.argv.includes("--tax-summary")) {
-  const lines = existsSync(CSV_FILE) ? readFileSync(CSV_FILE,"utf8").trim().split("\n").slice(1) : [];
+  const lines = existsSync(CSV_FILE) ? readFileSync(CSV_FILE, "utf8").trim().split("\n").slice(1) : [];
   const live  = lines.filter(l => l.includes(",LIVE"));
-  console.log(`\nTrades gesamt: ${lines.length} | Live: ${live.length} | Paper: ${lines.filter(l=>l.includes(",PAPER")).length}`);
+  console.log(`\nTrades gesamt: ${lines.length} | Live: ${live.length} | Paper: ${lines.filter(l => l.includes(",PAPER")).length}`);
 } else {
   run().catch(e => { console.error("Fehler:", e); process.exit(1); });
 }
