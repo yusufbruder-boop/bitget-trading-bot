@@ -61,6 +61,18 @@ const WEEKDAY_COMMODITIES = [
 const NEWS_BULLISH = ["ceasefire","peace","deal","rate cut","etf approved","stimulus","upgrade","earnings beat","ai","partnership","profit","growth","record"];
 const NEWS_BEARISH = ["war","attack","invasion","tariff","ban","crash","recession","rate hike","miss","downgrade","hack","bankruptcy","fraud","loss","sanction"];
 
+// Gold-spezifische News-Schlüsselwörter
+const GOLD_NEWS_BULLISH = [
+  "gold rally","safe haven","dollar falls","rate cut","fed cut","inflation rise","geopolitical",
+  "war","attack","crisis","recession","dollar weak","dxy fall","stimulus","etf inflow",
+  "gold demand","central bank buy","gold surge","record high","rate pause",
+];
+const GOLD_NEWS_BEARISH = [
+  "dollar rises","dxy rise","fed hike","rate hike","real yield","risk-on","gold falls",
+  "treasury yield","taper","tightening","strong dollar","gold sell","etf outflow",
+  "gold drop","gold slump","profit taking","gold selloff",
+];
+
 const LOG_FILE = "safety-check-log.json";
 const CSV_FILE = "trades.csv";
 
@@ -181,6 +193,29 @@ async function getNewsBias(symbol) {
   }
 }
 
+// ─── Gold News Sentiment ──────────────────────────────────────────────────────
+
+async function getGoldNewsBias() {
+  try {
+    const url = `https://news.google.com/rss/search?q=gold+price+XAU&hl=en-US&gl=US&ceid=US:en`;
+    const res  = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    const xml  = await res.text();
+    const titles = [...xml.matchAll(/<title><!\[CDATA\[(.*?)\]\]><\/title>/g)]
+      .map(m => m[1].toLowerCase()).slice(0, 15);
+    let bull = 0, bear = 0;
+    for (const t of titles) {
+      for (const k of GOLD_NEWS_BULLISH) if (t.includes(k)) bull++;
+      for (const k of GOLD_NEWS_BEARISH) if (t.includes(k)) bear++;
+    }
+    console.log(`  Google News Gold: 🟢 ${bull} | 🔴 ${bear}`);
+    if (bull > bear + 1) return "bullish";
+    if (bear > bull + 1) return "bearish";
+    return "neutral";
+  } catch {
+    return "neutral";
+  }
+}
+
 // ─── Marktdaten ───────────────────────────────────────────────────────────────
 
 const BINANCE_INTERVAL = { "1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m","1H":"1h","4H":"4h","1D":"1d" };
@@ -212,6 +247,18 @@ async function fetchCandles(symbol, limit = 200) {
   }
 }
 
+// Gold-Kerzen — immer von BitGet, verschiedene Zeitrahmen
+async function fetchGoldCandles(timeframe, limit = 200) {
+  const gran = BITGET_GRANULARITY[timeframe] || "1H";
+  const url  = `${CONFIG.bitget.baseUrl}/api/v2/mix/market/candles?symbol=XAUUSDT&productType=USDT-FUTURES&granularity=${gran}&limit=${limit}`;
+  const res  = await fetch(url, { signal: AbortSignal.timeout(8000) });
+  const json = await res.json();
+  if (json.code !== "00000") throw new Error(`BitGet Gold-Kerzen (${gran}): ${json.msg}`);
+  return json.data
+    .map(k => ({ time: +k[0], open: +k[1], high: +k[2], low: +k[3], close: +k[4], volume: +k[5] }))
+    .reverse();
+}
+
 // ─── Indikatoren ──────────────────────────────────────────────────────────────
 
 function ema(closes, period) {
@@ -241,6 +288,91 @@ function vwap(candles) {
   const tpv = sess.reduce((s,c) => s + ((c.high+c.low+c.close)/3)*c.volume, 0);
   const vol = sess.reduce((s,c) => s + c.volume, 0);
   return vol === 0 ? null : tpv / vol;
+}
+
+// ─── Erweiterte Indikatoren ───────────────────────────────────────────────────
+
+// EMA als Array (für MACD benötigt)
+function emaArray(values, period) {
+  if (values.length < period) return [];
+  const k = 2 / (period + 1);
+  const result = [];
+  let val = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  result.push(val);
+  for (let i = period; i < values.length; i++) {
+    val = values[i] * k + val * (1 - k);
+    result.push(val);
+  }
+  return result;
+}
+
+// Average True Range
+function atr(candles, period = 14) {
+  if (candles.length < period + 1) return null;
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    trs.push(Math.max(
+      candles[i].high - candles[i].low,
+      Math.abs(candles[i].high - candles[i - 1].close),
+      Math.abs(candles[i].low  - candles[i - 1].close),
+    ));
+  }
+  let val = trs.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < trs.length; i++) val = (val * (period - 1) + trs[i]) / period;
+  return val;
+}
+
+// Bollinger Bands
+function bollingerBands(closes, period = 20, multiplier = 2) {
+  if (closes.length < period) return null;
+  const slice = closes.slice(-period);
+  const mean  = slice.reduce((a, b) => a + b, 0) / period;
+  const std   = Math.sqrt(slice.reduce((s, v) => s + (v - mean) ** 2, 0) / period);
+  return { upper: mean + multiplier * std, middle: mean, lower: mean - multiplier * std, std };
+}
+
+// MACD (12, 26, 9)
+function macd(closes, fast = 12, slow = 26, signal = 9) {
+  const fastArr = emaArray(closes, fast);
+  const slowArr = emaArray(closes, slow);
+  if (!slowArr.length || !fastArr.length) return null;
+  const offset  = slow - fast;
+  const macdArr = slowArr.map((s, i) => fastArr[i + offset] - s);
+  const sigArr  = emaArray(macdArr, signal);
+  if (!sigArr.length) return null;
+  const macdVal = macdArr.at(-1);
+  const sigVal  = sigArr.at(-1);
+  return { macd: macdVal, signal: sigVal, histogram: macdVal - sigVal };
+}
+
+// Swing-Hochs / -Tiefs → Schlüsselniveaus
+function findKeyLevels(candles) {
+  const levels = [];
+  const h = candles.map(c => c.high);
+  const l = candles.map(c => c.low);
+  for (let i = 2; i < candles.length - 2; i++) {
+    if (h[i] > h[i-1] && h[i] > h[i-2] && h[i] > h[i+1] && h[i] > h[i+2])
+      levels.push({ price: h[i], type: "resistance" });
+    if (l[i] < l[i-1] && l[i] < l[i-2] && l[i] < l[i+1] && l[i] < l[i+2])
+      levels.push({ price: l[i], type: "support" });
+  }
+  // Cluster ähnliche Niveaus (innerhalb 0.2%)
+  const used = new Set();
+  const clustered = [];
+  for (let i = 0; i < levels.length; i++) {
+    if (used.has(i)) continue;
+    const group = [levels[i]];
+    for (let j = i + 1; j < levels.length; j++) {
+      if (!used.has(j) && Math.abs(levels[j].price - levels[i].price) / levels[i].price < 0.002) {
+        group.push(levels[j]); used.add(j);
+      }
+    }
+    used.add(i);
+    const avg  = group.reduce((s, x) => s + x.price, 0) / group.length;
+    const type = group.filter(x => x.type === "support").length > group.length / 2 ? "support" : "resistance";
+    clustered.push({ price: avg, type, strength: group.length });
+  }
+  return clustered.sort((a, b) => b.strength - a.strength).slice(0, 8);
 }
 
 // ─── Gebühren-Check ───────────────────────────────────────────────────────────
@@ -368,6 +500,169 @@ function getSignal(price, ema8, vwapVal, rsi3, newsBias) {
   return { allPass: false, direction: null };
 }
 
+// ─── Gold Chart Analyse ───────────────────────────────────────────────────────
+
+async function analyzeGoldChart() {
+  console.log("\n" + "═".repeat(60));
+  console.log("  GOLD (XAUUSDT) — Chart Analyse");
+  console.log(`  ${new Date().toISOString()}`);
+  console.log("═".repeat(60));
+
+  // Alle Zeitrahmen parallel laden
+  let c15m, c1h, c4h;
+  try {
+    [c15m, c1h, c4h] = await Promise.all([
+      fetchGoldCandles("15m", 120),
+      fetchGoldCandles("1H",  200),
+      fetchGoldCandles("4H",  100),
+    ]);
+  } catch (e) {
+    console.log(`  ❌ Datenfehler: ${e.message}`);
+    return null;
+  }
+
+  const price = c1h.at(-1).close;
+  console.log(`\n  Aktueller Preis: $${price.toFixed(2)}\n`);
+
+  // ── 4H Analyse ──────────────────────────────────────────────
+  console.log("── 4H Timeframe ───────────────────────────────────────────\n");
+  const cl4h    = c4h.map(c => c.close);
+  const ema8_4h  = ema(cl4h, 8);
+  const ema21_4h = ema(cl4h, 21);
+  const ema50_4h = ema(cl4h, 50);
+  const rsi14_4h = rsi(cl4h, 14);
+  const macd4h   = macd(cl4h);
+  const atr4h    = atr(c4h, 14);
+  const bb4h     = bollingerBands(cl4h, 20, 2);
+
+  const trend4h =
+    ema8_4h > ema21_4h && ema21_4h > ema50_4h ? "BULLISCH" :
+    ema8_4h < ema21_4h && ema21_4h < ema50_4h ? "BÄRISCH"  : "SEITWÄRTS";
+
+  console.log(`  Trend (EMA Stack):  ${trend4h}`);
+  console.log(`  EMA(8)  $${ema8_4h?.toFixed(2)}  EMA(21) $${ema21_4h?.toFixed(2)}  EMA(50) $${ema50_4h?.toFixed(2)}`);
+  console.log(`  RSI(14): ${rsi14_4h?.toFixed(1)}${rsi14_4h > 70 ? "  ⚠️  Überkauft" : rsi14_4h < 30 ? "  ⚠️  Überverkauft" : "  ✅ Normal"}`);
+  if (macd4h) console.log(`  MACD: ${macd4h.macd.toFixed(2)} | Signal ${macd4h.signal.toFixed(2)} | Hist ${macd4h.histogram > 0 ? "+" : ""}${macd4h.histogram.toFixed(2)} ${macd4h.histogram > 0 ? "📈" : "📉"}`);
+  if (atr4h)  console.log(`  ATR(14): $${atr4h.toFixed(2)}  (4H-Volatilität)`);
+  if (bb4h) {
+    const bbW = ((bb4h.upper - bb4h.lower) / bb4h.middle * 100).toFixed(2);
+    console.log(`  BB(20,2): $${bb4h.lower.toFixed(2)} — $${bb4h.middle.toFixed(2)} — $${bb4h.upper.toFixed(2)}  Breite ${bbW}%`);
+  }
+
+  // ── 1H Analyse ──────────────────────────────────────────────
+  console.log("\n── 1H Timeframe ───────────────────────────────────────────\n");
+  const cl1h    = c1h.map(c => c.close);
+  const ema8_1h  = ema(cl1h, 8);
+  const ema21_1h = ema(cl1h, 21);
+  const rsi14_1h = rsi(cl1h, 14);
+  const rsi3_1h  = rsi(cl1h, 3);
+  const macd1h   = macd(cl1h);
+  const atr1h    = atr(c1h, 14);
+  const bb1h     = bollingerBands(cl1h, 20, 2);
+  const vwap1h   = vwap(c1h);
+
+  const trend1h = ema8_1h > ema21_1h ? "BULLISCH" : "BÄRISCH";
+
+  console.log(`  Trend (EMA8 vs EMA21): ${trend1h}`);
+  console.log(`  EMA(8) $${ema8_1h?.toFixed(2)}  EMA(21) $${ema21_1h?.toFixed(2)}`);
+  console.log(`  VWAP:  $${vwap1h?.toFixed(2)}  (Preis ${price > vwap1h ? "ÜBER ▲" : "UNTER ▼"} VWAP)`);
+  console.log(`  RSI(14): ${rsi14_1h?.toFixed(1)}  RSI(3): ${rsi3_1h?.toFixed(1)}`);
+  if (macd1h) console.log(`  MACD: ${macd1h.macd.toFixed(2)} | Signal ${macd1h.signal.toFixed(2)} | Hist ${macd1h.histogram > 0 ? "+" : ""}${macd1h.histogram.toFixed(2)} ${macd1h.histogram > 0 ? "📈" : "📉"}`);
+  if (atr1h)  console.log(`  ATR(14): $${atr1h.toFixed(2)}`);
+  if (bb1h)   console.log(`  BB(20,2): $${bb1h.lower.toFixed(2)} — $${bb1h.middle.toFixed(2)} — $${bb1h.upper.toFixed(2)}`);
+
+  // ── 15m Analyse ─────────────────────────────────────────────
+  console.log("\n── 15m Timeframe (Einstieg) ───────────────────────────────\n");
+  const cl15m   = c15m.map(c => c.close);
+  const ema8_15m = ema(cl15m, 8);
+  const rsi3_15m = rsi(cl15m, 3);
+  const atr15m   = atr(c15m, 14);
+  const vwap15m  = vwap(c15m);
+
+  console.log(`  EMA(8)  $${ema8_15m?.toFixed(2)}  VWAP $${vwap15m?.toFixed(2)}`);
+  console.log(`  RSI(3): ${rsi3_15m?.toFixed(1)}  ATR: $${atr15m?.toFixed(2)}`);
+  console.log(`  Preis ${price > ema8_15m ? "über" : "unter"} EMA(8) | ${price > vwap15m ? "über" : "unter"} VWAP`);
+
+  // ── Schlüsselniveaus ─────────────────────────────────────────
+  console.log("\n── Schlüsselniveaus (1H Swing-Analyse) ────────────────────\n");
+  const levels  = findKeyLevels(c1h.slice(-80));
+  const res_lvl = levels.filter(l => l.type === "resistance" && l.price > price).sort((a, b) => a.price - b.price).slice(0, 3);
+  const sup_lvl = levels.filter(l => l.type === "support"    && l.price < price).sort((a, b) => b.price - a.price).slice(0, 3);
+
+  if (res_lvl.length) { console.log("  Widerstand:"); res_lvl.forEach(l => console.log(`    R $${l.price.toFixed(2)}  (${l.strength}× berührt)`)); }
+  if (sup_lvl.length) { console.log("  Unterstützung:"); sup_lvl.forEach(l => console.log(`    S $${l.price.toFixed(2)}  (${l.strength}× berührt)`)); }
+
+  // ── News Sentiment ───────────────────────────────────────────
+  console.log("\n── Gold News Sentiment ─────────────────────────────────────\n");
+  const newsBias = await getGoldNewsBias();
+  console.log(`  Sentiment: ${newsBias.toUpperCase()}  ${newsBias === "bullish" ? "📈" : newsBias === "bearish" ? "📉" : "⚖️"}`);
+
+  // ── Signal-Score ─────────────────────────────────────────────
+  console.log("\n── Signal-Score ────────────────────────────────────────────\n");
+  const scoreItems = [];
+  const add = (pts, cond, label) => scoreItems.push({ pts, cond, label });
+
+  add(2, trend4h === "BULLISCH",                                  "4H EMA-Stack bullisch");
+  add(2, trend4h === "BÄRISCH",                                   "4H EMA-Stack bärisch");
+  add(1, trend1h === trend4h && trend4h === "BULLISCH",           "1H + 4H Trend aligned ▲");
+  add(1, trend1h === trend4h && trend4h === "BÄRISCH",            "1H + 4H Trend aligned ▼");
+  add(1, price > vwap1h && trend4h === "BULLISCH",                "Preis über VWAP in Auftrend");
+  add(1, price < vwap1h && trend4h === "BÄRISCH",                 "Preis unter VWAP in Abtrend");
+  add(1, (macd1h?.histogram ?? 0) > 0 && (macd4h?.histogram ?? 0) > 0, "MACD 1H + 4H beide positiv");
+  add(1, (macd1h?.histogram ?? 0) < 0 && (macd4h?.histogram ?? 0) < 0, "MACD 1H + 4H beide negativ");
+  add(1, rsi3_1h < 30 && trend4h === "BULLISCH",                 "RSI(3) überverkauft → Long-Einstieg");
+  add(1, rsi3_1h > 70 && trend4h === "BÄRISCH",                  "RSI(3) überkauft → Short-Einstieg");
+  add(1, newsBias === "bullish" && trend4h === "BULLISCH",        "News bestätigt Auftrend");
+  add(1, newsBias === "bearish" && trend4h === "BÄRISCH",         "News bestätigt Abtrend");
+
+  const bbWidth4h = bb4h ? (bb4h.upper - bb4h.lower) / bb4h.middle * 100 : 999;
+  add(1, bbWidth4h < 1.5,                                        "BB-Squeeze → Ausbruch erwartet");
+
+  let rawScore = 0;
+  const maxRaw = 13; // Summe aller möglichen Punkte
+  for (const { pts, cond, label } of scoreItems) {
+    if (cond) { rawScore += pts; console.log(`  +${pts} ✅ ${label}`); }
+    else                           console.log(`   0    ${label}`);
+  }
+
+  const signalStrength = Math.min(Math.round((rawScore / maxRaw) * 10), 10);
+  console.log(`\n  Score ${rawScore}/${maxRaw} → Stärke ${"█".repeat(signalStrength)}${"░".repeat(10 - signalStrength)} ${signalStrength}/10`);
+
+  // Richtung bestimmen
+  const bullVotes = (trend4h === "BULLISCH" ? 1 : 0) + (trend1h === "BULLISCH" ? 1 : 0)
+                  + (price > vwap1h ? 1 : 0) + ((macd1h?.histogram ?? 0) > 0 ? 1 : 0);
+  const bearVotes = (trend4h === "BÄRISCH" ? 1 : 0) + (trend1h === "BÄRISCH" ? 1 : 0)
+                  + (price < vwap1h ? 1 : 0) + ((macd1h?.histogram ?? 0) < 0 ? 1 : 0);
+
+  let direction = null;
+  if (bullVotes > bearVotes && signalStrength >= 5) direction = "long";
+  else if (bearVotes > bullVotes && signalStrength >= 5) direction = "short";
+
+  // ── Trade-Empfehlung ─────────────────────────────────────────
+  console.log("\n── Trade-Empfehlung ────────────────────────────────────────\n");
+
+  if (direction && atr1h) {
+    const tp  = direction === "long" ? price + atr1h * 2 : price - atr1h * 2;
+    const sl  = direction === "long" ? price - atr1h * 1 : price + atr1h * 1;
+    const rr  = Math.abs(tp - price) / Math.abs(sl - price);
+
+    console.log(`  Richtung:   ${direction.toUpperCase()} ${direction === "long" ? "📈" : "📉"}`);
+    console.log(`  Entry:      $${price.toFixed(2)}`);
+    console.log(`  TP (2×ATR): $${tp.toFixed(2)}  (+$${Math.abs(tp - price).toFixed(2)})`);
+    console.log(`  SL (1×ATR): $${sl.toFixed(2)}  (-$${Math.abs(sl - price).toFixed(2)})`);
+    console.log(`  R/R-Ratio:  ${rr.toFixed(2)}:1`);
+    if (sup_lvl.length) console.log(`  Nächste Unterstützung: $${sup_lvl[0].price.toFixed(2)}`);
+    if (res_lvl.length) console.log(`  Nächster Widerstand:   $${res_lvl[0].price.toFixed(2)}`);
+  } else if (signalStrength < 5) {
+    console.log(`  ⏸️  Signal zu schwach (${signalStrength}/10) — kein Trade`);
+  } else {
+    console.log(`  ⚖️  Kein klarer Bias — abwarten`);
+  }
+
+  console.log("\n" + "═".repeat(60) + "\n");
+  return { direction, signalStrength, price, atr: atr1h, vwap: vwap1h, ema8: ema8_1h };
+}
+
 // ─── Logging ──────────────────────────────────────────────────────────────────
 
 function loadLog() {
@@ -405,6 +700,42 @@ async function tradeSymbol(symbol, log) {
   const existing = await getOpenPosition(symbol);
   if (existing) {
     console.log(`  ⏭️  Position bereits offen (${existing.holdSide}, ${existing.total} Kontrakte) — überspringen`);
+    return;
+  }
+
+  // Gold: Erweiterte Chart-Analyse (Multi-Timeframe)
+  if (symbol === "XAUUSDT") {
+    const goldAnalysis = await analyzeGoldChart();
+    if (!goldAnalysis || !goldAnalysis.direction || goldAnalysis.signalStrength < 5) return;
+    // Weiter mit direction aus Gold-Analyse
+    const { direction, price: goldPrice, atr: goldAtr } = goldAnalysis;
+    const margin = Math.min(CONFIG.portfolioValue * 0.015, CONFIG.maxTradeSizeUSD);
+    const { ok: feesOk, notional, tpProfit, feeRoundTrip } = feeCheck(margin, CONFIG.leverage, CONFIG.tpPercent);
+    if (!feesOk) { console.log(`  🚫 Gebühren-Check fehlgeschlagen`); return; }
+    const logEntry = {
+      timestamp: new Date().toISOString(), symbol, direction, price: goldPrice,
+      margin, notional, paperTrading: CONFIG.paperTrading, orderPlaced: false,
+      orderId: null, tpPrice: null, slPrice: null,
+    };
+    console.log(`\n── Order (Gold) ────────────────────────────────────────────\n`);
+    console.log(`  ${direction.toUpperCase()} XAUUSDT | Margin $${margin.toFixed(0)} × ${CONFIG.leverage}x = $${notional.toFixed(0)}`);
+    if (CONFIG.paperTrading) {
+      const tp = direction === "long" ? goldPrice * (1 + CONFIG.tpPercent / 100) : goldPrice * (1 - CONFIG.tpPercent / 100);
+      const sl = direction === "long" ? goldPrice * (1 - CONFIG.slPercent / 100) : goldPrice * (1 + CONFIG.slPercent / 100);
+      logEntry.orderId = `PAPER-GOLD-${Date.now()}`;
+      logEntry.tpPrice = tp.toFixed(2); logEntry.slPrice = sl.toFixed(2); logEntry.orderPlaced = true;
+      console.log(`  📋 PAPER — würde ${direction.toUpperCase()} @ $${goldPrice.toFixed(2)} | TP $${tp.toFixed(2)} | SL $${sl.toFixed(2)}`);
+    } else {
+      try {
+        await setLeverage(symbol, CONFIG.leverage);
+        const order = await placeOrder(symbol, direction, margin, goldPrice);
+        logEntry.orderPlaced = true; logEntry.orderId = order.orderId;
+        logEntry.tpPrice = order.tpPrice; logEntry.slPrice = order.slPrice;
+        console.log(`  ✅ ORDER PLATZIERT #${order.orderId}`);
+      } catch (err) { console.log(`  ❌ ORDER FEHLER: ${err.message}`); logEntry.error = err.message; }
+    }
+    log.trades.push(logEntry);
+    writeCsv(logEntry);
     return;
   }
 
@@ -522,6 +853,9 @@ if (process.argv.includes("--tax-summary")) {
   const lines = existsSync(CSV_FILE) ? readFileSync(CSV_FILE,"utf8").trim().split("\n").slice(1) : [];
   const live  = lines.filter(l => l.includes(",LIVE"));
   console.log(`\nTrades gesamt: ${lines.length} | Live: ${live.length} | Paper: ${lines.filter(l=>l.includes(",PAPER")).length}`);
+} else if (process.argv.includes("--gold")) {
+  // Standalone Gold-Chart-Analyse (kein Trade, nur Auswertung)
+  analyzeGoldChart().catch(e => { console.error("Gold-Analyse Fehler:", e); process.exit(1); });
 } else {
   run().catch(e => { console.error("Fehler:", e); process.exit(1); });
 }
