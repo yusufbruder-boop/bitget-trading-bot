@@ -61,6 +61,21 @@ const WEEKDAY_COMMODITIES = [
 const NEWS_BULLISH = ["ceasefire","peace","deal","rate cut","etf approved","stimulus","upgrade","earnings beat","ai","partnership","profit","growth","record"];
 const NEWS_BEARISH = ["war","attack","invasion","tariff","ban","crash","recession","rate hike","miss","downgrade","hack","bankruptcy","fraud","loss","sanction"];
 
+// Gold reagiert umgekehrt zu Risiko-Assets: Krisen/Inflation = bullisch, Zinserhöhungen/Stärke USD = bärisch
+const GOLD_NEWS_BULLISH = [
+  "safe haven","rate cut","fed pivot","dollar weakness","dollar falls","dollar tumbles",
+  "central bank buying","gold rally","gold surges","gold hits","gold record",
+  "geopolitical tension","recession fear","etf inflow","inflation fear",
+  "war","crisis","conflict","uncertainty","risk off","gold demand","Fed dovish",
+  "interest rate cut","yield drops","yields fall",
+];
+const GOLD_NEWS_BEARISH = [
+  "rate hike","hawkish","fed tightening","strong dollar","dollar strength",
+  "dollar rises","dollar rallies","risk on","equity rally","gold falls",
+  "gold selloff","gold drops","gold tumbles","etf outflow","profit taking",
+  "yields rise","yield surge","Fed hawkish",
+];
+
 const LOG_FILE = "safety-check-log.json";
 const CSV_FILE = "trades.csv";
 
@@ -173,6 +188,28 @@ async function getNewsBias(symbol) {
       for (const k of NEWS_BEARISH) if (t.includes(k)) bear++;
     }
     console.log(`  News [${name}]: 🟢 ${bull}  🔴 ${bear}`);
+    if (bull > bear + 1) return "bullish";
+    if (bear > bull + 1) return "bearish";
+    return "neutral";
+  } catch {
+    return "neutral";
+  }
+}
+
+async function getGoldNewsBias() {
+  try {
+    const url = `https://news.google.com/rss/search?q=${encodeURIComponent("Gold price XAU")}&hl=en-US&gl=US&ceid=US:en`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    const xml = await res.text();
+    const titles = [...xml.matchAll(/<title><!\[CDATA\[(.*?)\]\]><\/title>/g)]
+      .map(m => m[1].toLowerCase()).slice(0, 15);
+
+    let bull = 0, bear = 0;
+    for (const t of titles) {
+      for (const k of GOLD_NEWS_BULLISH) if (t.includes(k)) bull++;
+      for (const k of GOLD_NEWS_BEARISH) if (t.includes(k)) bear++;
+    }
+    console.log(`  Gold-News [XAU]: 🟢 ${bull}  🔴 ${bear}`);
     if (bull > bear + 1) return "bullish";
     if (bear > bull + 1) return "bearish";
     return "neutral";
@@ -409,9 +446,10 @@ async function tradeSymbol(symbol, log) {
   }
 
   // 2. Liquidität + Funding (Crypto) & News parallel
+  // Gold bekommt einen eigenen News-Bias (safe-haven Logik ist umgekehrt zu Aktien)
   const [liquidityBias, newsBias] = await Promise.all([
     getLiquidityBias(symbol),
-    getNewsBias(symbol),
+    symbol === "XAUUSDT" ? getGoldNewsBias() : getNewsBias(symbol),
   ]);
   console.log(`  Liquidität: ${liquidityBias.toUpperCase()} | News: ${newsBias.toUpperCase()}`);
 
@@ -493,6 +531,101 @@ async function tradeSymbol(symbol, log) {
   writeCsv(logEntry);
 }
 
+// ─── Gold Long-Analyse ────────────────────────────────────────────────────────
+
+async function checkGoldLong() {
+  console.log("═══════════════════════════════════════════════════════════");
+  console.log("  Gold (XAUUSDT) — Long-Prüfung");
+  console.log(`  ${new Date().toISOString()}`);
+  console.log("═══════════════════════════════════════════════════════════");
+
+  // 1. Gold-spezifischer News-Bias
+  console.log("\n── News-Analyse ─────────────────────────────────────────────\n");
+  const newsBias = await getGoldNewsBias();
+  console.log(`  Gold News-Bias: ${newsBias.toUpperCase()}`);
+
+  // 2. Kerzen holen
+  console.log("\n── Marktdaten ───────────────────────────────────────────────\n");
+  let candles;
+  try { candles = await fetchCandles("XAUUSDT"); }
+  catch (e) { console.log(`  ❌ Keine Daten: ${e.message}`); return; }
+
+  const closes  = candles.map(c => c.close);
+  const price   = closes.at(-1);
+  const ema8    = ema(closes, 8);
+  const ema21   = ema(closes, 21);
+  const vwapVal = vwap(candles);
+  const rsi3    = rsi(closes, 3);
+  const rsi14   = rsi(closes, 14);
+
+  const distPct = vwapVal ? Math.abs((price - vwapVal) / vwapVal) * 100 : null;
+
+  console.log(`  Preis:   $${price.toFixed(2)}`);
+  console.log(`  EMA(8):  $${ema8?.toFixed(2)   || "—"}`);
+  console.log(`  EMA(21): $${ema21?.toFixed(2)  || "—"}`);
+  console.log(`  VWAP:    $${vwapVal?.toFixed(2) || "—"}  (Abstand ${distPct?.toFixed(2) || "—"}%)`);
+  console.log(`  RSI(3):  ${rsi3?.toFixed(1)    || "—"}`);
+  console.log(`  RSI(14): ${rsi14?.toFixed(1)   || "—"}`);
+
+  if (!ema8 || !ema21 || !vwapVal || rsi3 === null || rsi14 === null) {
+    console.log("\n  ⚠️  Nicht genug Daten für vollständige Analyse");
+    return;
+  }
+
+  // 3. Bedingungen mit Gewichtung
+  console.log("\n── Long-Bedingungen ──────────────────────────────────────────\n");
+
+  const conds = [
+    { w: "kritisch", label: "News-Bias nicht bearish",            pass: newsBias !== "bearish",  detail: `Bias: ${newsBias.toUpperCase()}` },
+    { w: "stark",    label: "Preis > EMA(8)  — kurzfrist. bullisch", pass: price > ema8,           detail: `$${price.toFixed(2)} vs $${ema8.toFixed(2)}` },
+    { w: "stark",    label: "Preis > EMA(21) — mittelfrist. bullisch", pass: price > ema21,          detail: `$${price.toFixed(2)} vs $${ema21.toFixed(2)}` },
+    { w: "stark",    label: "EMA(8) > EMA(21) — Auftrend bestätigt", pass: ema8 > ema21,           detail: `EMA8 $${ema8.toFixed(2)} vs EMA21 $${ema21.toFixed(2)}` },
+    { w: "mittel",   label: "Preis > VWAP — Käufer dominieren",   pass: price > vwapVal,         detail: `$${price.toFixed(2)} vs VWAP $${vwapVal.toFixed(2)}` },
+    { w: "einstieg", label: "RSI(3) < 35  — kurzfristig überverkauft", pass: rsi3 < 35,             detail: `RSI(3) = ${rsi3.toFixed(1)}` },
+    { w: "einstieg", label: "VWAP-Abstand < 2.0% — nahe Session-Anker", pass: distPct < 2.0,         detail: `${distPct.toFixed(2)}%` },
+    { w: "filter",   label: "RSI(14) < 65 — nicht überkauft",     pass: rsi14 < 65,             detail: `RSI(14) = ${rsi14.toFixed(1)}` },
+  ];
+
+  for (const c of conds) {
+    console.log(`  ${c.pass ? "✅" : "🚫"} [${c.w.padEnd(8)}] ${c.label}`);
+    console.log(`             ${c.detail}`);
+  }
+
+  const criticalOk  = conds.filter(c => c.w === "kritisch").every(c => c.pass);
+  const strongScore = conds.filter(c => c.w === "stark").filter(c => c.pass).length;
+  const entryOk     = conds.filter(c => c.w === "einstieg").every(c => c.pass);
+  const filterOk    = conds.filter(c => c.w === "filter").every(c => c.pass);
+  const totalPassed = conds.filter(c => c.pass).length;
+
+  console.log("\n── Fazit ─────────────────────────────────────────────────────\n");
+  console.log(`  Bestanden: ${totalPassed}/${conds.length}`);
+  console.log(`  Kritisch:  ${criticalOk  ? "✅ OK"        : "🚫 FEHLGESCHLAGEN"}`);
+  console.log(`  Stark:     ${strongScore}/3 (mind. 2 nötig)`);
+  console.log(`  Einstieg:  ${entryOk     ? "✅ OK"        : "⏳ Warten"}`);
+  console.log(`  Filter:    ${filterOk    ? "✅ OK"        : "🚫 Überkauft"}`);
+
+  if (!criticalOk) {
+    console.log("\n  🚫 KEIN LONG — News blocken (bearisher Bias für Gold)");
+    console.log("     Gold-Longs scheitern bei USD-Stärke / Zinserhöhungserwartung");
+  } else if (strongScore >= 2 && entryOk && filterOk) {
+    const tp = (price * (1 + CONFIG.tpPercent / 100)).toFixed(2);
+    const sl = (price * (1 - CONFIG.slPercent / 100)).toFixed(2);
+    console.log("\n  🟢 LONG-SIGNAL AKTIV");
+    console.log(`     Entry: $${price.toFixed(2)}`);
+    console.log(`     TP:    $${tp} (+${CONFIG.tpPercent}%)`);
+    console.log(`     SL:    $${sl} (-${CONFIG.slPercent}%)`);
+  } else if (strongScore >= 2 && !entryOk) {
+    console.log("\n  ⏳ WARTEN — Trend bullisch, aber RSI noch nicht überverkauft");
+    console.log("     Auf Rücksetzer warten: RSI(3) < 35 oder VWAP-Touch");
+  } else {
+    const missing = conds.filter(c => !c.pass && c.w === "stark").map(c => c.label);
+    console.log("\n  ❌ KEIN LONG — Trend nicht klar genug");
+    if (missing.length) { console.log("     Fehlende Trend-Bedingungen:"); missing.forEach(m => console.log(`     • ${m}`)); }
+  }
+
+  console.log("\n═══════════════════════════════════════════════════════════\n");
+}
+
 // ─── Haupt ────────────────────────────────────────────────────────────────────
 
 async function run() {
@@ -522,6 +655,8 @@ if (process.argv.includes("--tax-summary")) {
   const lines = existsSync(CSV_FILE) ? readFileSync(CSV_FILE,"utf8").trim().split("\n").slice(1) : [];
   const live  = lines.filter(l => l.includes(",LIVE"));
   console.log(`\nTrades gesamt: ${lines.length} | Live: ${live.length} | Paper: ${lines.filter(l=>l.includes(",PAPER")).length}`);
+} else if (process.argv.includes("--check-gold-long")) {
+  checkGoldLong().catch(e => { console.error("Fehler:", e); process.exit(1); });
 } else {
   run().catch(e => { console.error("Fehler:", e); process.exit(1); });
 }
