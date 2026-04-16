@@ -1,7 +1,7 @@
 {
-  "name": "claude-tradingview-mcp-trading",
+  "name": "bitget-trading-bot",
   "version": "1.0.0",
-  "description": "Automated trading bot — Claude + TradingView strategy + BitGet execution",
+  "description": "BitGet trading bot — EMA(8) + RSI(3) + VWAP + Polymarket insider signals",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
