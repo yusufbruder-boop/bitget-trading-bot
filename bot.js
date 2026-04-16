@@ -168,15 +168,15 @@ async function fetchCandles(symbol, limit = 200) {
     const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
     const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
     if (!res.ok) throw new Error(`Binance ${res.status}`);
-    const data = await res.json();
-    return data.map(k => ({ time:+k[0], open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5] }));
+    const json = await res.json();
+    return (json.data ?? json).map(k => ({ time:+k[0], open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5] }));
   } else {
     const gran = BITGET_GRANULARITY[CONFIG.timeframe] || "1m";
     const url = `${CONFIG.bitget.baseUrl}/api/v2/mix/market/candles?symbol=${symbol}&productType=USDT-FUTURES&granularity=${gran}&limit=${limit}`;
     const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
     const json = await res.json();
     if (json.code !== "00000") throw new Error(`BitGet Kerzen: ${json.msg}`);
-    return json.data
+    return (json.data ?? json)
       .map(k => ({ time:+k[0], open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5] }))
       .reverse();
   }
