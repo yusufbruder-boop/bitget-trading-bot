@@ -5,7 +5,10 @@
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "dev": "node bot.js"
+    "dev": "node bot.js",
+    "once": "node bot.js --once",
+    "tax-summary": "node bot.js --tax-summary",
+    "railway-check": "node scripts/railway-check.mjs"
   },
   "dependencies": {
     "dotenv": "^16.4.5"
